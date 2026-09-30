@@ -20,10 +20,12 @@ public class GateService {
 
     private final Db db;
     private final SchedulingService scheduling;
+    private final ColdEventService coldEvents;
 
-    public GateService(Db db, SchedulingService scheduling) {
+    public GateService(Db db, SchedulingService scheduling, ColdEventService coldEvents) {
         this.db = db;
         this.scheduling = scheduling;
+        this.coldEvents = coldEvents;
     }
 
     @Transactional
@@ -146,6 +148,8 @@ public class GateService {
                 WHERE trip_id = ? AND type = 'DOCK_CONGESTION' AND status = 'OPEN'
                 """, actor, Timestamp.valueOf(db.now()), tripId);
         db.event(tripId, "GATE_ADMITTED", "DISPATCH", actor, "闸口核验通过（预约/车牌/封签一致），放行入园");
+        // feature-4-b：车辆入园后自动聚合冷链事件时间线（预约单/车辆司机/冷机/铅封/温度/卸货批次）
+        coldEvents.ensureForTrip(tripId, actor);
         Map<String, Object> view = db.getTripByCode(code);
         view.put("admitted", true);
         view.put("reasons", List.of());

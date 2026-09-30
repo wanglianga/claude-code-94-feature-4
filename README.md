@@ -1,6 +1,6 @@
 # 物流园冷链车辆预约入场与温控异常协同服务
 
-基于 **Java 17 + Spring Boot 3 + PostgreSQL** 的 0-1 工程，覆盖冷链车辆「预约 → 窗口生成 → 闸口核验 → 月台接车 → 温度/卸货/质检 → 异常多方协同 → 处置定责结算 → 客户签收追溯」全流程。
+基于 **Java 17 + Spring Boot 3 + PostgreSQL** 的 0-1 工程，覆盖冷链车辆「预约 → 窗口生成 → 闸口核验 → 月台接车 → 温度/卸货/质检 → 异常多方协同 → 处置定责结算 → 客户签收追溯」全流程，并在 feature-4-b 中提供「冷链事件时间线聚合 → 温度区间复盘（传感器离线 vs 真实超温/多区间合并）→ 异常工单并行补证（四方角色证据版本化）→ 客户逐批次收货决定与冲突升级审批 → 赔付候选方案版本化与审批后生效 → 一页可审计时间线」的异常闭环。
 
 ---
 
@@ -14,8 +14,9 @@
 
 - Spring Boot 3.3（Web / JDBC / Security / Validation），JdbcTemplate 直写 SQL，无额外重型依赖。
 - PostgreSQL 16（仅 compose 内网，**不发布到宿主**）。
+- springdoc-openapi：OpenAPI 3.x 文档 `/v3/api-docs`，Swagger UI `/swagger-ui.html`（免认证可打开，调接口时在 Authorize 填 Basic 账号）。
 - 多阶段 Dockerfile：Maven 构建 → JRE 运行；**非 root 用户** + **HEALTHCHECK**。
-- 鉴权：HTTP Basic + 五类角色 `CARRIER / DISPATCH / QC / CS / SETTLE`，无状态。
+- 鉴权：HTTP Basic + 六类角色 `CARRIER / DISPATCH / QC / CS / SETTLE / SUPERVISOR`，无状态。
 - 库表由 `schema.sql` 自动建表、`data.sql` 自动播种（幂等，可重复启动）。
 
 ## 快速启动（宿主 docker compose 一键部署）
@@ -53,7 +54,8 @@ docker compose down
 | `dispatch` | `dispatch123` | 园区调度 DISPATCH | 闸口核验放行、改约、货主改仓、限电开关、异常闭环定责、排队放行、调度看板 |
 | `qc` | `qc123` | 质检员 QC | 月台卸货登记（开门前温度/照片/破损）、质检抽样、放行/隔离/降级/拒收处置决定 |
 | `cs` | `cs123` | 客户客服 CS | 查看客户可理解的异常解释（责任/货损/预计放行时间）、客户签收、运输质量追溯 |
-| `settle` | `settle123` | 结算员 SETTLE | 责任金额测算预览、确认扣罚/赔付、落地承运商信用分调整 |
+| `settle` | `settle123` | 结算员 SETTLE | 责任金额测算预览、赔付候选方案编制/提交/审批后入账 |
+| `supervisor` | `super123` | 升级审批主管 SUPERVISOR（运营主管/质量与商务经理） | L1/L2 冲突审批与绑定裁定、大额赔付终审、驳回方案、客户决定时限延期 |
 
 ## 演示主数据
 
@@ -105,7 +107,74 @@ BOOKED ──闸口核验──> AT_GATE ──月台接车──> AT_DOCK ─�
 | 调度环节看板 | `/api/board/overview`、`/api/board/incidents` |
 | 客服可理解解释 | `/api/cs/trips/{code}/explanation` 输出客户语言的责任/货损/预计放行时间 |
 
-## 主要接口（均需 Basic 认证，除 `/api/health`）
+## feature-4-b：冷链事件时间线 · 并行补证 · 复盘升级 · 赔付审批
+
+### 核心对象与自动联动
+
+车辆入园（闸口放行）即自动生成一条 `cold_event`，把**预约单、车辆/司机、冷机设备、舱门传感器、电子铅封、温度曲线、卸货批次**聚合为一条冷链事件时间线。随后：
+
+- 冷机/舱门/铅封回调按 `event_id` **幂等入库**（重复回调、并发推送、重试均去重，不产生重复数据）；冷机温度点同步进统一温度曲线。
+- 系统实时做温度复盘：区分 **OFFLINE 传感器离线（数据断点）** 与 **EXCURSION 真实超温**，相邻异常区间按 `INTERVAL_MERGE_MINUTES`（默认 30 分钟）**自动合并**（异类合并为 MIXED，记录 `merged_count`）。
+- 命中 温度超阈 / 数据断点 / 铅封告警 / 卸货扫描与预约批次不一致 时：
+  - 幂等创建异常工单 `anomaly_ticket`（`business_key` 唯一）；
+  - **冻结相关批次的正常入库结算** `settlement_freeze`（温度/铅封冻全部批次，批次不符只冻该批次；按“区间+批次”去重，重复分析不重复冻结）。
+
+### 四方并行补证（角色强约束 + 证据只追加版本化）
+
+| 角色 | 账号 | 只能提交的证据类型 |
+|---|---|---|
+| 承运商 CARRIER | carrier1/2 | `DEVICE_RAW_LOG` 设备原始日志、`DWELLING_NOTE` 停靠说明 |
+| 园区 PARK（DISPATCH） | dispatch | `GATE_RECORD` 闸口记录、`UNLOAD_RECORD` 卸货记录 |
+| 质检 QC | qc | `QC_RECHECK` 复检结论（可带逐批次结论） |
+| 客户 CUSTOMER（CS 代提交） | cs | `CUSTOMER_DECISION` 继续收/降级/拒收 |
+
+- 任何一方补证**都不能覆盖原始数据**：每次提交生成新版本（`version`），旧版本置 `superseded=true` 但永久保留，含提交人与时间。
+- 四方可**并行**补证（各角色版本链独立）。
+- 客户在时限（合同 `customer_decision_hours`，默认 24h）内逐批次选择 `ACCEPT / DOWNGRADE / REJECT`，支持**同一批次部分可收/部分拒收**（按 `acceptedPieces`）。超期需主管延期。
+
+### 复盘规则
+
+- **传感器离线 vs 真实超温**：结合承运商设备日志/停靠说明、舱门/铅封事件与质检复检，对区间给出 `SENSOR_OFFLINE / REAL_EXCURSION / INCONCLUSIVE` 结论与责任方（CARRIER/PARK/OWNER/SHARED/NONE）。
+- **多个异常区间合并**：相邻（≤30 分钟或重叠）区间自动合并，混合区间单独定责；被更大区间取代的旧区间保留为 `CLOSED/SUPERSEDED` 可审计，其工单迁移到新区间。
+- **同一批次部分可收/部分拒收**：赔付仅按拒收/降级损失件计算。
+- **客户决定与质检结论冲突**：自动创建 **L1** 升级审批，工单转 `ESCALATED`；主管可在审批中给出**绑定裁定**（逐批次权威结论，落为最终收货决定）。L1 审批人可显式升级 L2。
+
+### 赔付候选方案与审批后生效
+
+- 结算员基于**责任归属、可收数量、合同阈值（赔付率上限/降级折扣/起赔额/L2 金额线）、客户选择**计算候选方案（`GET /api/proposals/cold-events/{eventNo}/calculate`，含未满足项 `blockers`）。
+- 方案**版本化**：`generate` 生成 DRAFT，旧的未生效方案置 `SUPERSEDED`；**证据被替换或审批被驳回时自动撤销未生效草稿并重新计算**。
+- 生效门控（全部满足才能写入结算）：无 PENDING/REJECTED 升级审批；大额赔付（≥合同 L2 阈值）有通过的 L2 终审；工单全部闭环、责任已判定、无 FROZEN 批次、异常批次均有客户决定。
+- 只有审批链完整后 `post` 才写入 `settlement_ledger`（冷链事件唯一）+ 更新车次结算与承运商信用分；**行锁 + 唯一约束保证重复回调、并发补证、重试不会生成重复赔付或重复冻结**，重复 post 幂等返回。
+
+### 一页可审计时间线
+
+`GET /api/audit/trips/{code}` 一页给出：冷链事件要素、每个断点（温度区间/批次/铅封）的**证据、处置、责任结论、赔付状态**，工单逐版本证据、客户决定、升级链、冻结/解冻、赔付方案全版本与正式入账、承运商信用分（后续预约影响），以及 SHA-256 审计指纹。
+
+### feature-4-b 主要接口（均需 Basic，除 Swagger/health）
+
+| 方法 & 路径 | 角色 | 说明 |
+|---|---|---|
+| GET/POST `/api/cold-events/trips/{code}` | 多角色 | 冷链事件时间线（入园自动建，POST 可补舱门传感器号） |
+| GET `/api/cold-events/{eventNo}` | 多角色 | 事件聚合视图（区间/工单/冻结/回调/温度/时间线） |
+| POST `/api/callback/{eventNo}/chiller` `/door` `/seal` | CARRIER | 冷机/舱门/铅封回调，`eventId` 幂等 |
+| POST `/api/events/trips/{code}/unload-scan` | DISPATCH | 卸货扫描批次与预约核对，不符只冻该批 |
+| POST `/api/tickets/{no}/evidence` | 四方 | 提交本角色证据（业务层强校验类型，版本化只追加） |
+| POST `/api/tickets/{no}/customer-decision` | CS | 客户逐批次 继续收/降级/拒收（含部分拒收） |
+| GET `/api/tickets/{no}` · GET `/api/tickets/cold-events/{eventNo}` | 多角色 | 工单详情（证据版本/决定/冻结/升级）/ 列表 |
+| POST `/api/review/tickets/{no}/conclusion` | QC/DISPATCH | 区间复盘（离线/超温/存疑）+ 责任方 |
+| POST `/api/review/tickets/{no}/close` | QC/DISPATCH | 闭环工单并释放冻结（审批链完整才允许） |
+| POST `/api/review/tickets/{no}/extend-due` | SUPERVISOR | 延长客户决定时限 |
+| POST `/api/escalations/{id}/decision` | SUPERVISOR | L1/L2 审批 APPROVE/REJECT，可带 `bindingChoices` 绑定裁定、`requireL2` |
+| GET `/api/cold-events/{eventNo}/escalations` | 多角色 | 升级链 |
+| GET `/api/proposals/cold-events/{eventNo}/calculate` | SETTLE | 候选方案实时测算（含 blockers） |
+| POST `/api/proposals/cold-events/{eventNo}/generate` | SETTLE | 生成新版本 DRAFT（旧草稿作废） |
+| GET `/api/proposals/cold-events/{eventNo}` · GET `/api/proposals/{id}` | SETTLE/主管 | 方案版本列表 / 详情 |
+| POST `/api/proposals/{id}/submit` | SETTLE | 提交审批链（大额自动 L2） |
+| POST `/api/proposals/{id}/post` | SETTLE | 审批链完整后幂等入账（重复/并发不重复赔付） |
+| POST `/api/proposals/{id}/reject` | SUPERVISOR | 驳回方案，退回补证重算 |
+| GET `/api/audit/trips/{code}` · `/api/audit/events/{eventNo}` | 多角色 | 一页可审计异常时间线 |
+
+## 主要接口（基线：预约入场协同，均需 Basic 认证，除 `/api/health`）
 
 | 方法 & 路径 | 角色 | 说明 |
 |---|---|---|
@@ -137,12 +206,42 @@ BOOKED ──闸口核验──> AT_GATE ──月台接车──> AT_DOCK ─�
 ## 一键端到端验证脚本
 
 ```bash
-# 需宿主机有 curl；CC_PUBLISH_PORT 为应用宿主端口
+# 需宿主机有 curl/python3；CC_PUBLISH_PORT 为应用宿主端口
 export CC_PUBLISH_PORT=$(docker compose port app 8080 | cut -d: -f2)
-bash scripts/smoke.sh
+bash scripts/smoke.sh                 # 基线：预约入场协同（40 项断言）
+CC_BASE_URL=http://host.docker.internal:${CC_PUBLISH_PORT} python3 scripts/smoke_feature4b.py
+# feature-4-b：冷链事件/幂等回调/区间合并/并行补证/冲突升级/赔付审批（44 项断言，含并发重复回调、并发入账）
 ```
 
-脚本依次跑通：① 多货主混装正常车全流程（预约→闸口→月台→温度→质检→放行→结算→签收→追溯）；② 温度断点+超限+化冻车（隔离→降级→承运商全责扣罚赔付→信用分下调→客服解释）；③ 封签异常闸口排队→调度核验闭环→放行；④ 证件过期车闸口拦截；⑤ 限电开关后仅自备发电月台可排窗；⑥ 调度看板与异常台。
+- 基线脚本依次跑通：① 多货主混装正常车全流程；② 温度断点+超限+化冻车（隔离→降级→承运商全责）；③ 封签异常闸口排队闭环；④ 证件过期拦截；⑤ 限电仅自备发电月台可排窗；⑥ 调度看板与异常台。
+- feature-4-b 脚本依次跑通：① 两断点合并/离线vs超温区分/一致拒收/大额 L2/并发重复回调与并发入账幂等；② 客户与质检冲突→L1 驳回→证据替换撤销草稿→重做一致→L1→L2 生效；③ 同批次部分可收 70/部分拒收 30；④ 扫描批次不符只冻该批、铅封告警并发幂等、四方并行补证、版本保留、主管时限延期、审计页。
+
+### 本地开发（无 Docker，直连 PostgreSQL）
+
+```bash
+# 1) 准备库
+createdb -U <user> coldchain
+# 2) 运行（schema.sql/data.sql 自动建表播种）
+SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/coldchain \
+SPRING_DATASOURCE_USERNAME=<user> SPRING_DATASOURCE_PASSWORD=<pwd> \
+PARK_CLOCK=2026-09-30T13:00:00 SERVER_PORT=8088 \
+mvn spring-boot:run
+# 3) 验证
+CC_BASE_URL=http://localhost:8088 python3 scripts/smoke_feature4b.py
+```
+
+接口文档：浏览器打开 `http://localhost:8088/swagger-ui.html`（容器部署时把 8088 换成宿主映射端口），OpenAPI JSON：`/v3/api-docs`。
+
+### 实际执行过的验证（本机）
+
+交付前在本机使用 **Maven 3 + JDK17 + PostgreSQL 15（独立实例，库 `coldchain`）** 实际启动应用并跑通（非仅静态编译）：
+
+- `mvn package` 构建成功，应用以 `schema.sql/data.sql` 自动建表播种启动，`/api/health` 正常。
+- 基线冒烟 `scripts/smoke.py`：**40 项断言全部通过，0 失败**。
+- feature-4-b 冒烟 `scripts/smoke_feature4b.py`：**44 项断言全部通过，0 失败**，其中实际并发执行了「重复/并发冷机回调」「重复/并发铅封告警回调」「并发赔付 post」，确认无重复数据/工单/冻结/赔付。
+- OpenAPI `/v3/api-docs` 返回 200（53 个路径），`/swagger-ui.html` 可打开；并验证角色越权返回 403、跨承运商回调返回 409。
+
+> 说明：本机无 Docker daemon，未执行 `docker compose build`；Dockerfile/compose 沿用已验证的多阶段结构，依赖在镜像构建期由 Maven 拉取（springdoc 已在本机 Maven 构建中验证可解析）。
 
 ## 目录结构
 
@@ -151,16 +250,20 @@ bash scripts/smoke.sh
 ├── docker-compose.yml         # app + postgres（仅发布 app 端口）
 ├── .env.example
 ├── pom.xml
-├── scripts/smoke.sh           # 端到端业务流冒烟
+├── scripts/smoke.sh              # 基线端到端冒烟（预约入场协同）
+├── scripts/smoke_feature4b.sh    # feature-4-b 冒烟（异常工单/补证/升级/赔付，含并发幂等）
+├── scripts/smoke_feature4b.py
 └── src/main/
     ├── resources/
     │   ├── application.yml
-    │   ├── schema.sql         # 表结构
-    │   └── data.sql           # 角色账号/主数据
+    │   ├── schema.sql         # 表结构（基线 + feature-4-b 事件/区间/工单/证据/升级/冻结/赔付/合同）
+    │   └── data.sql           # 角色账号（含主管）/主数据/合同阈值/复盘参数
     └── java/com/logpark/coldchain/
-        ├── config/            # Spring Security 五角色
-        ├── support/           # 时钟、异常、全局错误
+        ├── config/            # Spring Security 六角色 + OpenAPI 3
+        ├── support/           # 时钟、异常、全局错误、角色映射、JSON
         ├── repo/Db.java
-        ├── service/           # 排程/预约/闸口/月台质检/调度/处置结算/客服/看板/追溯
-        └── web/               # REST 控制器
+        ├── service/           # 基线：排程/预约/闸口/月台质检/调度/处置结算/客服/看板/追溯
+        │                    # feature-4-b：ColdEvent(事件/回调/区间)/Ticket(补证)/Escalation(升级)/
+        │                    #               SettlementProposal(赔付版本/审批生效)/Audit(审计时间线)
+        └── web/               # REST 控制器（含 ColdEvent/Ticket/Escalation/Proposal/Audit）
 ```

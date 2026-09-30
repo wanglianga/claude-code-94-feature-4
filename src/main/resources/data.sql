@@ -60,8 +60,21 @@ INSERT INTO park_setting (key, value) VALUES
     ('POWER_LIMIT',            'false'), -- 园区限电开关
     ('LATE_TOLERANCE_MINUTES', '30'),    -- 晚到容忍分钟
     ('WINDOW_MINUTES',         '30'),    -- 单窗口时长
-    ('TEMP_GAP_MINUTES',       '45')     -- 温度曲线相邻点最大间隔，超过判定断点
+    ('TEMP_GAP_MINUTES',       '45'),    -- 温度曲线相邻点最大间隔，超过判定断点
+    -- feature-4-b 复盘参数
+    ('INTERVAL_MERGE_MINUTES', '30'),    -- 相邻异常区间间隔 ≤ 该值则合并为一个区间
+    ('SENSOR_OFFLINE_MINUTES', '45'),    -- 相邻数据间隔超过该值视为传感器离线
+    ('CUSTOMER_DECISION_HOURS','24'),    -- 客户补证/决定默认时限
+    ('L2_COMPENSATION_THRESHOLD','5000') -- 赔付超过该值升级 L2 审批
 ON CONFLICT (key) DO NOTHING;
+
+-- 合同阈值（逐货主）：赔付率上限、降级折扣、起赔额、客户决定时限、L2 阈值
+INSERT INTO owner_contract (owner_id, compensation_rate_max, downgrade_rate, min_claim_amount,
+                            customer_decision_hours, require_l2_threshold) VALUES
+    (1, 1.00, 0.50, 0,    24, 5000),  -- 盒马：全赔、降级5折、24h时限
+    (2, 0.90, 0.60, 200,  24, 5000),  -- 蒙牛：赔付率上限90%、起赔200
+    (3, 0.80, 0.50, 500,  48, 3000)   -- 永辉：赔付率上限80%、48h时限
+ON CONFLICT (owner_id) DO NOTHING;
 
 -- 逐角色账号（明文演示口令，生产应使用强哈希）
 INSERT INTO app_user (username, password, display_name, role, carrier_id, owner_id) VALUES
@@ -70,5 +83,6 @@ INSERT INTO app_user (username, password, display_name, role, carrier_id, owner_
     ('dispatch', '{noop}dispatch123','园区调度-周琳', 'DISPATCH', NULL, NULL),
     ('qc',       '{noop}qc123',      '质检员-吴凯',   'QC',       NULL, NULL),
     ('cs',       '{noop}cs123',      '客户客服-林悦', 'CS',       NULL, NULL),
-    ('settle',   '{noop}settle123',  '结算员-郑华',   'SETTLE',   NULL, NULL)
+    ('settle',   '{noop}settle123',  '结算员-郑华',   'SETTLE',   NULL, NULL),
+    ('supervisor','{noop}super123',  '运营主管/质量经理-高岩', 'SUPERVISOR', NULL, NULL)
 ON CONFLICT (username) DO NOTHING;

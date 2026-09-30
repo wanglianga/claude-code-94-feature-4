@@ -20,6 +20,12 @@ logging:
   level:
     com.logpark: INFO
 
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
 park:
   # 园区运营基准时钟（演示用），为空时使用系统时钟
   clock: ${PARK_CLOCK:}
