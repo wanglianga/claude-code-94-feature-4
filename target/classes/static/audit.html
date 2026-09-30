@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冷链异常审计时间线</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f141b; color: #dbe4ee; padding: 24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #8fa3b8; font-size: 13px; margin-bottom: 16px; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+  input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #2c3a4d; background: #182230; color: #dbe4ee; font-size: 14px; }
+  button { background: #2563eb; border: none; cursor: pointer; color: #fff; }
+  button:hover { background: #1d4ed8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .card { background: #16202d; border: 1px solid #26344a; border-radius: 10px; padding: 14px 16px; }
+  .card h2 { font-size: 15px; color: #7dd3fc; margin-bottom: 10px; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; row-gap: 4px; font-size: 13px; }
+  .kv b { color: #8fa3b8; font-weight: normal; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #22304a; vertical-align: top; }
+  th { color: #8fa3b8; font-weight: normal; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; margin: 1px 2px; }
+  .t-open { background: #7f1d1d; } .t-review { background: #92400e; } .t-esc { background: #9d174d; }
+  .t-done { background: #14532d; } .t-frozen { background: #7f1d1d; } .t-rel { background: #14532d; }
+  .t-eff { background: #14532d; } .t-draft { background: #374151; } .t-rev { background: #4b5563; } .t-appr { background: #1e3a8a; }
+  .anomaly { border-left: 3px solid #f59e0b; }
+  .timeline { position: relative; margin-top: 8px; }
+  .tl-item { display: grid; grid-template-columns: 150px 90px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px dashed #22304a; font-size: 12.5px; }
+  .tl-item .src { color: #7dd3fc; }
+  .err { color: #f87171; margin: 10px 0; white-space: pre-wrap; }
+  .muted { color: #64748b; }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; color: #a5b4c8; }
+</style>
+</head>
+<body>
+<h1>冷链异常审计时间线</h1>
+<div class="sub">预约单 · 车辆/司机 · 冷机设备 · 舱门传感器 · 电子铅封 · 温度曲线 · 卸货批次 —— 一页可审计</div>
+<div class="bar">
+  <input id="user" placeholder="账号" value="dispatch" size="10">
+  <input id="pass" placeholder="口令" type="password" value="dispatch123" size="12">
+  <input id="code" placeholder="车次号 如 T2026090001" size="20">
+  <button onclick="load()">查询</button>
+  <span class="muted" style="align-self:center" id="hint"></span>
+</div>
+<div class="err" id="err"></div>
+<div id="out" style="display:none">
+  <div class="grid" id="cards"></div>
+  <div class="card"><h2>异常断点明细（证据 / 处置 / 责任 / 赔付）</h2><div id="anomalies"></div></div>
+  <div class="card" style="margin-top:14px"><h2>统一事件时间线</h2><div class="timeline" id="timeline"></div></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = v => v == null ? '<span class="muted">—</span>' : String(v);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function tag(txt, cls) { return `<span class="tag ${cls}">${esc(txt)}</span>`; }
+function statusTag(s) {
+  const m = {OPEN:'t-open',IN_REVIEW:'t-review',ESCALATED:'t-esc',RESOLVED:'t-done',
+             FROZEN:'t-frozen',RELEASED:'t-rel',EFFECTIVE:'t-eff',DRAFT:'t-draft',
+             REVOKED:'t-rev',REJECTED:'t-rev',IN_APPROVAL:'t-appr'};
+  return tag(s, m[s] || 't-draft');
+}
+async function load() {
+  $('err').textContent = ''; $('out').style.display = 'none';
+  const auth = 'Basic ' + btoa($('user').value + ':' + $('pass').value);
+  let r;
+  try {
+    r = await fetch('/api/audit/trips/' + encodeURIComponent($('code').value.trim()),
+      { headers: { 'Authorization': auth } });
+  } catch (e) { $('err').textContent = '网络错误: ' + e; return; }
+  if (!r.ok) { $('err').textContent = '查询失败 HTTP ' + r.status + '\n' + await r.text(); return; }
+  const d = await r.json();
+  render(d);
+  $('out').style.display = 'block';
+}
+function render(d) {
+  const t = d.trip, s = d.settlement, f = d.followUpImpact;
+  let html = '';
+  html += `<div class="card"><h2>预约 / 车辆 / 司机</h2><div class="kv">
+    <b>车次</b><span>${esc(t.code)} ${statusTag(t.status)}</span>
+    <b>承运商</b><span>${esc(t.carrier)}（信用分 ${t.carrierCreditScore}）</span>
+    <b>车牌</b><span>${esc(t.vehiclePlate)}</span>
+    <b>司机</b><span>${esc(t.driver)}（证照至 ${fmt(t.licenseExpireDate)}）</span>
+    <b>窗口</b><span>${fmt(t.windowStart)} ~ ${fmt(t.windowEnd)}</span>
+    <b>到园</b><span>${fmt(t.arrivedAt)}</span></div></div>`;
+  const dv = d.devices;
+  html += `<div class="card"><h2>设备关联</h2><div class="kv">
+    <b>冷机设备</b><span>${esc(dv.tempDeviceNo)} ${dv.reeferDevice[0] ? '(' + esc(dv.reeferDevice[0].model) + ')' : ''}</span>
+    <b>电子铅封</b><span>${esc(dv.eSealNo)}</span>
+    <b>舱门事件</b><span>${dv.doorEvents.map(e => esc(e.event + ' ' + e.occurred_at)).join('<br>') || '—'}</span>
+    <b>铅封事件</b><span>${dv.sealEvents.map(e => esc(e.event + ' ' + e.occurred_at)).join('<br>') || '—'}</span>
+    <b>离线心跳</b><span>${dv.offlineBeats.map(b => esc(b.beat_at)).join('<br>') || '—'}</span></div></div>`;
+  const tp = d.temperature.stats;
+  html += `<div class="card"><h2>温度曲线</h2><div class="kv">
+    <b>数据点</b><span>${tp.points}（最低 ${fmt(tp.min_c)}℃ / 最高 ${fmt(tp.max_c)}℃）</span>
+    <b>断点数</b><span>${tp.gaps}</span>
+    <b>断点位置</b><span>${d.temperature.gapPoints.map(g => esc(g.recorded_at)).join('<br>') || '—'}</span></div></div>`;
+  html += `<div class="card"><h2>批次与扫描</h2><table><tr><th>批次</th><th>货主</th><th>预约/扫描</th><th>比对</th><th>可收/拒收</th><th>冻结</th></tr>
+    ${d.batches.map(b => `<tr><td>${esc(b.batch_code)}</td><td>${esc(b.owner_name)}</td>
+      <td>${b.expected_qty}/${b.scanned_qty}</td><td>${esc(b.scan_status)}</td>
+      <td>${fmt(b.accept_qty)}/${fmt(b.reject_qty)}</td><td>${fmt(b.freeze_state)}</td></tr>`).join('')}
+    </table></div>`;
+  html += `<div class="card"><h2>结算与赔付</h2><div class="kv">
+    <b>责任方</b><span>${fmt(s.liabilityParty)}</span>
+    <b>扣罚</b><span>¥${fmt(s.penaltyAmount)}</span>
+    <b>赔付</b><span>¥${fmt(s.compensationAmount)}</span>
+    <b>冻结中批次</b><span>${s.frozenBatches}</span>
+    <b>生效赔付单</b><span>${s.effectivePayouts.map(p => '#' + p.id + ' ¥' + p.amount).join('，') || '—'}</span>
+    <b>结算时间</b><span>${fmt(s.settledAt)}</span></div></div>`;
+  html += `<div class="card"><h2>后续预约影响</h2><div class="kv">
+    <b>承运商</b><span>${esc(f.carrier)}（当前信用分 ${f.currentCreditScore}）</span>
+    <b>未结案工单</b><span>${f.openWorkOrders}</span>
+    <b>影响说明</b><span>${esc(f.impactNote)}</span></div></div>`;
+  $('cards').innerHTML = html;
+
+  $('anomalies').innerHTML = d.anomalies.length ? d.anomalies.map(a => `
+    <div class="card anomaly" style="margin-bottom:10px">
+      <div style="margin-bottom:6px">
+        ${tag('#' + a.workOrderId + ' ' + a.type, 't-appr')} ${statusTag(a.status)}
+        ${a.classification ? tag(a.classification, 't-review') : ''}
+        ${a.responsibility ? tag('责任:' + a.responsibility, 't-esc') : ''}
+        <span class="muted">${fmt(a.anomalyStart)} ~ ${fmt(a.anomalyEnd)}（合并区间 ${a.mergedIntervals} 个）</span>
+      </div>
+      ${a.classifyNote ? `<div class="muted" style="font-size:12px;margin-bottom:4px">复盘：${esc(a.classifyNote)}</div>` : ''}
+      ${a.reviewNote ? `<div class="muted" style="font-size:12px;margin-bottom:4px">结案：${esc(a.reviewNote)}</div>` : ''}
+      <table>
+        <tr><th>证据(角色/类型/版本)</th><th>提交人/时间</th><th>状态</th></tr>
+        ${a.evidence.map(e => `<tr><td>${esc(e.role)} / ${esc(e.evidence_type)} / v${e.version}</td>
+          <td>${esc(e.submitted_by)} ${esc(e.submitted_at)}</td>
+          <td>${e.active ? tag('有效','t-done') : tag('已被v后版本替换','t-rev')}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">暂无补证</td></tr>'}
+      </table>
+      <table style="margin-top:4px">
+        <tr><th>客户决定</th><th>冻结</th><th>赔付</th></tr>
+        <tr>
+          <td>${a.customerDecisions.map(c => `${esc(c.batch_code)}: ${esc(c.decision)} 收${c.accept_qty}/拒${c.reject_qty} ${c.active ? '' : '(旧)'}<br>`).join('') || '—'}</td>
+          <td>${a.freezes.map(z => `${esc(z.batch_code)} ${esc(z.reason)} ${statusTag(z.status)}<br>`).join('') || '—'}</td>
+          <td>${a.payouts.map(p => `#${p.id} v${p.calc_version} ¥${p.amount} ${statusTag(p.status)}<br>`).join('') || '—'}</td>
+        </tr>
+      </table>
+    </div>`).join('') : '<div class="muted">无异常工单</div>';
+
+  $('timeline').innerHTML = d.timeline.map(e =>
+    `<div class="tl-item"><span>${esc(e.at).replace('T', ' ').substring(0, 19)}</span>
+     <span class="src">${esc(e.source)}</span>
+     <span>[${esc(e.type)}] ${esc(e.detail || '')} <span class="muted">${esc(e.actor || '')}</span></span></div>`).join('');
+}
+</script>
+</body>
+</html>

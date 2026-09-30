@@ -72,3 +72,33 @@ INSERT INTO app_user (username, password, display_name, role, carrier_id, owner_
     ('cs',       '{noop}cs123',      '客户客服-林悦', 'CS',       NULL, NULL),
     ('settle',   '{noop}settle123',  '结算员-郑华',   'SETTLE',   NULL, NULL)
 ON CONFLICT (username) DO NOTHING;
+
+-- ============================================================
+-- feature-4 种子：客户账号 / 复盘与赔付参数 / 货主合同阈值 / 冷机设备
+-- ============================================================
+
+-- 客户账号（仅可对本货主批次提交收货决定）
+INSERT INTO app_user (username, password, display_name, role, carrier_id, owner_id) VALUES
+    ('customer1', '{noop}customer123', '盒马收货-沈青', 'CUSTOMER', NULL, 1),
+    ('customer2', '{noop}customer123', '蒙牛收货-罗成', 'CUSTOMER', NULL, 2),
+    ('customer3', '{noop}customer123', '永辉收货-许岚', 'CUSTOMER', NULL, 3)
+ON CONFLICT (username) DO NOTHING;
+
+-- feature-4 园区参数
+INSERT INTO park_setting (key, value) VALUES
+    ('MERGE_WINDOW_MINUTES',   '15'),  -- 复盘：相邻异常区间间隔不超过该值则合并为一个区间
+    ('CUSTOMER_DECISION_HOURS','48')   -- 客户收货决定时限（自工单创建起）
+ON CONFLICT (key) DO NOTHING;
+
+-- 货主合同阈值（赔付候选计算依据）：合同允许累计超温分钟 / 温度容差℃ / 降级折价率
+UPDATE cargo_owner SET contract_max_excursion_minutes = 30, contract_temp_tolerance_c = 1.0, downgrade_rate = 0.50 WHERE code = 'HEMA';
+UPDATE cargo_owner SET contract_max_excursion_minutes = 45, contract_temp_tolerance_c = 1.5, downgrade_rate = 0.40 WHERE code = 'MENGNIU';
+UPDATE cargo_owner SET contract_max_excursion_minutes = 60, contract_temp_tolerance_c = 2.0, downgrade_rate = 0.30 WHERE code = 'YH';
+
+-- 冷机设备台账（演示：两车冷机）
+INSERT INTO reefer_device (device_no, carrier_id, model, registered_at)
+SELECT 'RF-SF-001', 1, '冷王T-800Pro', NOW()
+WHERE NOT EXISTS (SELECT 1 FROM reefer_device WHERE device_no = 'RF-SF-001');
+INSERT INTO reefer_device (device_no, carrier_id, model, registered_at)
+SELECT 'RF-JD-002', 2, '开利S-550', NOW()
+WHERE NOT EXISTS (SELECT 1 FROM reefer_device WHERE device_no = 'RF-JD-002');

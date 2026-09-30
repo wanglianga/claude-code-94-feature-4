@@ -19,6 +19,9 @@ USERS = {
     "qc": "qc123",
     "cs": "cs123",
     "settle": "settle123",
+    "customer1": "customer123",
+    "customer2": "customer123",
+    "customer3": "customer123",
 }
 
 PASS, FAIL = 0, 0
@@ -203,6 +206,32 @@ def main():
     _, pv2 = req("GET", f"/api/settle/trips/{c2}/preview", "settle")
     check(pv2["liabilityParty"] == "CARRIER", "责任归集：承运商全责")
     check(abs(float(pv2["lossAmount"]) - 4000.0) < 0.01, "货损估算=100件×80×50%=4000")
+
+    # feature-4：温度断点/超限已自动冻结批次结算，须先闭环异常工单（分类→客户决定→结案→赔付审批）
+    _, wos2 = req("GET", f"/api/work-orders?tripCode={c2}", "dispatch")
+    check(len(wos2) >= 2, "温度断点/超限自动生成异常工单并冻结批次")
+    s, _ = req("POST", f"/api/settle/trips/{c2}/confirm", "settle", {}, expect=409)
+    check(s == 409, "批次冻结中，结算确认被阻断")
+    for w in wos2:
+        if w["type"] in ("TEMP_EXCURSION", "DATA_GAP"):
+            req("POST", f"/api/work-orders/{w['id']}/classify", "qc",
+                {"classification": "REAL_EXCURSION", "note": "开门温度-6℃佐证真实超温"})
+    _, t2b = req("GET", f"/api/appointments/{c2}", "dispatch")
+    b2 = t2b["batches"][0]["id"]
+    wo2exc = next(w for w in wos2 if w["type"] == "TEMP_EXCURSION")
+    req("POST", f"/api/work-orders/{wo2exc['id']}/customer-decision", "customer1",
+        {"batchId": b2, "decision": "DOWNGRADE", "acceptQty": 0, "rejectQty": 100})
+    for w in wos2:
+        req("POST", f"/api/work-orders/{w['id']}/resolve", "dispatch",
+            {"responsibility": "CARRIER", "note": "承运商冷机故障全责"})
+    _, pays2 = req("GET", f"/api/payouts?tripCode={c2}", "settle")
+    draft2 = [p for p in pays2 if p["status"] == "DRAFT"]
+    check(len(draft2) == 1 and abs(float(draft2[0]["amount"]) - 4000.0) < 0.01,
+          "赔付候选=降级100件×80×50%=4000，审批链走完方可生效")
+    req("POST", f"/api/payouts/{draft2[0]['id']}/submit", "settle")
+    req("POST", f"/api/payouts/{draft2[0]['id']}/approve", "dispatch", {})
+    req("POST", f"/api/payouts/{draft2[0]['id']}/approve", "settle", {})
+
     _, st2 = req("POST", f"/api/settle/trips/{c2}/confirm", "settle", {})
     check(abs(float(st2["penalty_amount"]) - 6400.0) < 0.01,
           "承运商扣罚=货损4000+温度类定额罚款2400=6400")

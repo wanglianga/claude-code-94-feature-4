@@ -125,6 +125,24 @@ public class DispositionService {
         if (!"SETTLING".equals(trip.get("status"))) {
             throw ApiException.conflict("仅 SETTLING 环节可确认结算，当前=" + trip.get("status"));
         }
+        // feature-4：存在未解冻批次 → 禁止结算（异常工单未闭环）
+        List<Map<String, Object>> frozen = db.jdbc().queryForList("""
+                SELECT f.reason, b.batch_code FROM settlement_freeze f
+                JOIN trip_batch b ON b.id = f.batch_id
+                WHERE f.trip_id = ? AND f.status = 'FROZEN'
+                """, tripId);
+        if (!frozen.isEmpty()) {
+            throw ApiException.conflict("存在 " + frozen.size() + " 条未解冻批次（"
+                    + frozen.get(0).get("batch_code") + " 等），异常工单闭环前禁止入库结算");
+        }
+        // feature-4：存在未生效赔付候选 → 须先走完审批链
+        Integer pendingPayouts = db.jdbc().queryForObject(
+                "SELECT COUNT(*) FROM payout WHERE trip_id = ? AND status IN ('DRAFT','IN_APPROVAL')",
+                Integer.class, tripId);
+        if (pendingPayouts != null && pendingPayouts > 0) {
+            throw ApiException.conflict("存在 " + pendingPayouts
+                    + " 条未生效赔付候选（DRAFT/IN_APPROVAL），审批链完整前不能写入结算");
+        }
         Map<String, Object> calc = compute(tripId);
         String party = overrideParty != null && !overrideParty.isBlank()
                 ? overrideParty.toUpperCase() : (String) calc.get("liabilityParty");
@@ -140,11 +158,19 @@ public class DispositionService {
             case "SHARED" -> (BigDecimal) calc.get("fixedFines");
             default -> BigDecimal.ZERO;
         };
-        BigDecimal compensation = noLiability ? BigDecimal.ZERO : switch (party) {
-            case "CARRIER", "PARK" -> loss;
-            case "SHARED" -> loss.multiply(BigDecimal.valueOf(0.5));
-            default -> BigDecimal.ZERO;
-        };
+        // feature-4：已有生效赔付单时，客户赔付以审批链确认的赔付为准（审批链完整后才能生效）
+        BigDecimal payoutSum = db.jdbc().queryForObject(
+                "SELECT COALESCE(SUM(amount),0) FROM payout WHERE trip_id = ? AND status = 'EFFECTIVE'",
+                BigDecimal.class, tripId);
+        boolean hasPayouts = payoutSum != null && db.jdbc().queryForObject(
+                "SELECT COUNT(*) FROM payout WHERE trip_id = ? AND status = 'EFFECTIVE'",
+                Integer.class, tripId) > 0;
+        BigDecimal compensation = hasPayouts ? payoutSum
+                : noLiability ? BigDecimal.ZERO : switch (party) {
+                    case "CARRIER", "PARK" -> loss;
+                    case "SHARED" -> loss.multiply(BigDecimal.valueOf(0.5));
+                    default -> BigDecimal.ZERO;
+                };
 
         long carrierId = ((Number) trip.get("carrier_id")).longValue();
         int creditDelta = (Integer) calc.get("creditDelta");
@@ -154,9 +180,10 @@ public class DispositionService {
         Integer newScore = db.jdbc().queryForObject(
                 "SELECT credit_score FROM carrier WHERE id = ?", Integer.class, carrierId);
 
-        String note = String.format("结算确认：责任=%s，货损估算=%.2f，承运商扣罚=%.2f，客户赔付=%.2f，承运商信用分调整 %d→%d（后续预约优先级相应变化）。依据：%s",
+        String note = String.format("结算确认：责任=%s，货损估算=%.2f，承运商扣罚=%.2f，客户赔付=%.2f，承运商信用分调整 %d→%d（后续预约优先级相应变化）。依据：%s%s",
                 noLiability ? "无（正常放行）" : party, loss, penalty, compensation,
-                newScore - creditDelta, newScore, calc.get("basis"));
+                newScore - creditDelta, newScore, calc.get("basis"),
+                hasPayouts ? "；客户赔付取审批链生效赔付单合计 ¥" + payoutSum : "");
 
         db.updateTrip(tripId,
                 "liability_party = ?, penalty_amount = ?, compensation_amount = ?, liability_note = ?, " +

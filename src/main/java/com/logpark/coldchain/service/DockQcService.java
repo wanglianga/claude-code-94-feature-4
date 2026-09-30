@@ -25,9 +25,11 @@ import java.util.Map;
 public class DockQcService {
 
     private final Db db;
+    private final DetectionService detection;
 
-    public DockQcService(Db db) {
+    public DockQcService(Db db, DetectionService detection) {
         this.db = db;
+        this.detection = detection;
     }
 
     @Transactional
@@ -134,6 +136,13 @@ public class DockQcService {
         db.event(tripId, "TEMP_UPLOADED", "CARRIER", actor,
                 "上传温控原始数据 " + inserted + " 点（累计 " + all.size() + " 点），断点 " + gapCount + " 处，最高温 "
                         + (maxReading == null ? "N/A" : maxReading + "℃"));
+
+        // feature-4：超温合并区间/断点 → 自动冻结批次入库结算 + 创建可并行补证的异常工单（幂等）
+        List<Map<String, Object>> anomalies = detection.detectTemperatureAnomalies(tripId);
+        if (!anomalies.isEmpty()) {
+            db.event(tripId, "FREEZE_AUTO", "SYSTEM", "系统",
+                    "检出温度类异常区间 " + anomalies.size() + " 个，相关批次入库结算已自动冻结，异常工单待多方补证");
+        }
         return db.getTripByCode(code);
     }
 

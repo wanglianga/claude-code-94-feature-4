@@ -95,17 +95,37 @@ public class AppointmentService {
 
         for (Map<String, Object> line : lines) {
             OwnerInfo owner = ownerInfo(((Number) require(line, "ownerId")).longValue());
-            db.jdbc().update("""
+            long cargoId = db.jdbc().queryForObject("""
                     INSERT INTO trip_cargo (trip_id, owner_id, cargo_type, temp_zone, max_temp_celsius,
                         pieces, value_per_piece, target_warehouse)
                     VALUES (?,?,?,?,?,?,?,?)
-                    """, tripId, owner.id(),
+                    RETURNING id
+                    """, Long.class, tripId, owner.id(),
                     str(require(line, "cargoType")),
                     str(line.get("tempZone")).toUpperCase(),
                     new BigDecimal(str(require(line, "maxTempCelsius"))),
                     ((Number) require(line, "pieces")).intValue(),
                     owner.value(),
                     line.get("targetWarehouse") == null ? null : str(line.get("targetWarehouse")));
+            // 预约批次：承运商可按货主明细声明批次（卸货扫描比对基准）；未声明则自动生成单批次
+            int pieces = ((Number) require(line, "pieces")).intValue();
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> batches =
+                    (List<Map<String, Object>>) line.getOrDefault("batches", List.of());
+            if (batches.isEmpty()) {
+                db.jdbc().update("""
+                        INSERT INTO trip_batch (trip_id, cargo_id, batch_code, expected_qty)
+                        VALUES (?,?,?,?) ON CONFLICT (trip_id, batch_code) DO NOTHING
+                        """, tripId, cargoId, "B" + cargoId + "-01", pieces);
+            } else {
+                for (Map<String, Object> b : batches) {
+                    db.jdbc().update("""
+                            INSERT INTO trip_batch (trip_id, cargo_id, batch_code, expected_qty)
+                            VALUES (?,?,?,?) ON CONFLICT (trip_id, batch_code) DO NOTHING
+                            """, tripId, cargoId, str(require(b, "batchCode")),
+                            ((Number) require(b, "expectedQty")).intValue());
+                }
+            }
         }
 
         db.event(tripId, "BOOKED", "CARRIER", username,
@@ -227,6 +247,9 @@ public class AppointmentService {
         trip.put("tempReadings", db.jdbc().queryForList(
                 "SELECT device_no, recorded_at, celsius, gap_after FROM temp_reading " +
                 "WHERE trip_id = ? ORDER BY recorded_at", tripId));
+        trip.put("batches", db.jdbc().queryForList(
+                "SELECT id, cargo_id, batch_code, expected_qty, scanned_qty, scan_status, accept_qty, reject_qty " +
+                "FROM trip_batch WHERE trip_id = ? ORDER BY id", tripId));
         return trip;
     }
 

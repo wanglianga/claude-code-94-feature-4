@@ -47,6 +47,7 @@ public class SecurityConfig {
             .httpBasic(b -> {})
             .authorizeHttpRequests(reg -> reg
                 .requestMatchers("/api/health", "/error").permitAll()
+                .requestMatchers("/audit.html", "/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
                 .requestMatchers("/api/appointments/**", "/api/my/trips/**").hasAnyRole("CARRIER", "DISPATCH", "QC", "CS", "SETTLE")
                 .requestMatchers("/api/gate/**").hasRole("DISPATCH")
                 .requestMatchers("/api/dispatch/**").hasRole("DISPATCH")
@@ -61,6 +62,25 @@ public class SecurityConfig {
                 .requestMatchers("/api/cs/**").hasRole("CS")
                 .requestMatchers("/api/trace/**").hasAnyRole("CS", "CARRIER", "DISPATCH", "SETTLE")
                 .requestMatchers("/api/incidents/**").hasAnyRole("CARRIER", "DISPATCH", "QC", "CS", "SETTLE")
+                // feature-4：回调（设备/闸口/卸货扫描）
+                .requestMatchers("/api/callbacks/temperature", "/api/callbacks/heartbeat",
+                        "/api/callbacks/door", "/api/callbacks/seal").hasAnyRole("CARRIER", "DISPATCH")
+                .requestMatchers("/api/callbacks/unload-scan").hasAnyRole("QC", "DISPATCH")
+                // feature-4：工单与补证
+                .requestMatchers("/api/work-orders/*/evidence").hasAnyRole("CARRIER", "DISPATCH", "QC")
+                .requestMatchers("/api/work-orders/*/customer-decision").hasRole("CUSTOMER")
+                .requestMatchers("/api/work-orders/*/classify").hasAnyRole("QC", "DISPATCH")
+                .requestMatchers("/api/work-orders/*/resolve").hasRole("DISPATCH")
+                .requestMatchers("/api/work-orders/**").hasAnyRole(
+                        "CARRIER", "DISPATCH", "QC", "CS", "SETTLE", "CUSTOMER")
+                // feature-4：赔付与审批
+                .requestMatchers("/api/payouts/*/submit").hasRole("SETTLE")
+                .requestMatchers("/api/payouts/*/approve", "/api/payouts/*/reject").hasAnyRole("QC", "DISPATCH", "SETTLE")
+                .requestMatchers("/api/payouts/trips/*/compute").hasAnyRole("SETTLE", "DISPATCH")
+                .requestMatchers("/api/payouts/**").hasAnyRole("CARRIER", "DISPATCH", "QC", "CS", "SETTLE", "CUSTOMER")
+                // feature-4：一页可审计时间线
+                .requestMatchers("/api/audit/**").hasAnyRole(
+                        "CARRIER", "DISPATCH", "QC", "CS", "SETTLE", "CUSTOMER")
                 .requestMatchers("/api/whoami", "/api/clock").authenticated()
                 .anyRequest().denyAll())
             .exceptionHandling(e -> e

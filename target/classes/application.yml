@@ -1,0 +1,25 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: coldchain-appointment
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/coldchain}
+    username: ${SPRING_DATASOURCE_USERNAME:cold}
+    password: ${SPRING_DATASOURCE_PASSWORD:coldpass}
+    hikari:
+      maximum-pool-size: 10
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
+
+logging:
+  level:
+    com.logpark: INFO
+
+park:
+  # 园区运营基准时钟（演示用），为空时使用系统时钟
+  clock: ${PARK_CLOCK:}

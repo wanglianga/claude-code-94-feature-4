@@ -126,6 +126,11 @@ public class Db {
 
     // ---------------- 杂项 ----------------
 
+    /** PostgreSQL 事务级咨询锁：串行化同一 key 的并发写（版本号/重算等临界区）。 */
+    public void lock(String key) {
+        jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?))", String.class, key);
+    }
+
     public static BigDecimal bd(Object o) {
         return o == null ? null : (BigDecimal) o;
     }
